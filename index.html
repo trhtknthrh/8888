@@ -5758,3 +5758,1221 @@
         }
         if (mediaRecorder.state !== "inactive") {
           mediaRecorder.stop();
+        }
+        mediaRecorder = null;
+      }
+
+      function handleFileUpload(file, forceType) {
+        if (!file) return;
+        if (file.size > 15 * 1024 * 1024) {
+          showToast("הקובץ גדול מדי (מקסימום 15MB).");
+          return;
+        }
+        const isImg = forceType === "image" || file.type.startsWith("image/");
+
+        if (isImg) {
+          const previewUrl = URL.createObjectURL(file);
+          openModal(`
+            <div class="modal-header">
+              <span class="modal-title">שליחת תמונה</span>
+              <button type="button" class="icon-btn" id="closeImgCapModal">✕</button>
+            </div>
+            <div style="text-align:center;margin-bottom:14px;">
+              <img src="${previewUrl}" style="max-height:240px;max-width:100%;border-radius:10px;" alt="תצוגה" />
+            </div>
+            <div class="form-group">
+              <input type="text" id="imgCaptionInput" class="form-control" placeholder="הוסף כיתוב לתמונה (אופציונלי)..." />
+            </div>
+            <div class="modal-actions">
+              <button type="button" class="btn-secondary" id="cancelImgSend">ביטול</button>
+              <button type="button" class="btn-primary" id="confirmImgSend" style="width:auto;">שלח תמונה</button>
+            </div>
+          `);
+          $("closeImgCapModal").onclick = () => { URL.revokeObjectURL(previewUrl); closeModal(); };
+          $("cancelImgSend").onclick = () => { URL.revokeObjectURL(previewUrl); closeModal(); };
+          $("confirmImgSend").onclick = async () => {
+            const caption = $("imgCaptionInput").value.trim();
+            closeModal();
+            URL.revokeObjectURL(previewUrl);
+            showToast("מעלה תמונה לענן...");
+            try {
+              const cloudUrl = await uploadMediaToCloud(file, "images", file.name);
+              await sendMessage({
+                type: "image",
+                text: caption,
+                mediaUrl: cloudUrl,
+                fileName: file.name,
+                fileSize: file.size,
+                fileMime: file.type
+              });
+            } catch (err) {
+              showToast(err.message || "שגיאה בהעלאת התמונה.");
+            }
+          };
+        } else {
+          (async () => {
+            showToast("מעלה קובץ לענן...");
+            try {
+              const cloudUrl = await uploadMediaToCloud(file, "files", file.name);
+              await sendMessage({
+                type: "file",
+                mediaUrl: cloudUrl,
+                fileName: file.name,
+                fileSize: file.size,
+                fileMime: file.type
+              });
+              showToast(`הקובץ "${file.name}" נשלח.`);
+            } catch (err) {
+              showToast(err.message || "שגיאה בהעלאת הקובץ.");
+            }
+          })();
+        }
+      }
+
+      /* ===================== TYPING INDICATOR & @MENTIONS & SLASH MENU ===================== */
+      let typingTimeout = null;
+      let lastTypingBroadcastAt = 0;
+
+      function setTypingState(mode) {
+        const chatId = state.activeChatId;
+        if (!chatId) return;
+        const now = Date.now();
+        if (mode && now - lastTypingBroadcastAt < 1800) return;
+        lastTypingBroadcastAt = mode ? now : 0;
+        broadcastLiveActivity({ kind: "typing", chatId, mode });
+      }
+
+      function handleAdminSlashPopover() {
+        const popover = $("adminSlashPopover");
+        if (!popover) return;
+        const chat = state.chats[state.activeChatId];
+        const textarea = $("messageTextarea");
+        if (state.isAdminMode && chat && isSelfChat(chat) && textarea.value === "/") {
+          popover.classList.remove("hidden");
+        } else {
+          popover.classList.add("hidden");
+        }
+      }
+
+      function handleMentionAutocomplete() {
+        const chat = state.chats[state.activeChatId];
+        const popover = $("mentionPopover");
+        if (!chat || chat.type !== "group") {
+          popover.classList.add("hidden");
+          return;
+        }
+
+        const textarea = $("messageTextarea");
+        const cursorPos = textarea.selectionStart;
+        const textBefore = textarea.value.slice(0, cursorPos);
+        const match = textBefore.match(/(?:^|\s)@([a-zA-Z0-9._-]*)$/);
+
+        if (!match) {
+          popover.classList.add("hidden");
+          return;
+        }
+
+        const query = match[1].toLowerCase();
+        const members = chat.participants
+          .filter((id) => id !== state.currentUserId)
+          .map((id) => state.users[id])
+          .filter((u) => u && (u.username.toLowerCase().includes(query) || u.fullName.toLowerCase().includes(query)));
+
+        if (members.length === 0) {
+          popover.classList.add("hidden");
+          return;
+        }
+
+        $("mentionList").innerHTML = members.map((u) => `
+          <button type="button" class="attach-menu-item" data-pick-mention="${escapeHtml(u.username)}">
+            ${renderAvatarHTML(u, "sm", false)}
+            <div style="min-width:0;">
+              <div style="font-size:13px;font-weight:700;">${escapeHtml(u.fullName)}</div>
+              <div style="font-size:11.5px;color:var(--text-muted);" dir="ltr">@${escapeHtml(u.username)}</div>
+            </div>
+          </button>
+        `).join("");
+
+        popover.classList.remove("hidden");
+
+        $("mentionList").querySelectorAll("[data-pick-mention]").forEach((btn) => {
+          btn.onclick = () => {
+            const uname = btn.dataset.pickMention;
+            const replaced = textBefore.replace(/@([a-zA-Z0-9._-]*)$/, `@${uname} `);
+            textarea.value = replaced + textarea.value.slice(cursorPos);
+            popover.classList.add("hidden");
+            textarea.focus();
+            updateComposerButtonState();
+          };
+        });
+      }
+
+      /* ===================== GROUP CREATION MODAL ===================== */
+      function showCreateGroupModal() {
+        const meId = state.currentUserId;
+        const others = Object.values(state.users).filter((u) => u.id !== meId && !u.isBanned);
+
+        openModal(`
+          <div class="modal-header">
+            <span class="modal-title">יצירת קבוצה חדשה</span>
+            <button type="button" class="icon-btn" id="closeGroupModal">✕</button>
+          </div>
+          <div class="form-group">
+            <label>שם הקבוצה *</label>
+            <input type="text" id="newGroupName" class="form-control" placeholder="לדוגמה: צוות פיתוח / חברים" maxlength="45" />
+          </div>
+          <div class="form-group">
+            <label>תיאור הקבוצה (אופציונלי)</label>
+            <input type="text" id="newGroupDesc" class="form-control" placeholder="מטרת הקבוצה..." maxlength="100" />
+          </div>
+          <div class="form-group">
+            <label>בחר משתתפים לקבוצה (${others.length} זמינים):</label>
+            <div style="display:flex;flex-direction:column;gap:8px;max-height:220px;overflow-y:auto;">
+              ${others.length === 0 ? `<p style="font-size:13px;color:var(--text-muted);">אין משתמשים נוספים רשומים עדיין.</p>` : others.map((u) => `
+                <label class="existing-user-item" style="cursor:pointer;">
+                  <input type="checkbox" class="group-member-cb" value="${u.id}" style="width:18px;height:18px;accent-color:var(--accent);" />
+                  ${renderAvatarHTML(u, "sm", isUserVisiblyOnline(u))}
+                  <div style="flex:1;">
+                    <div style="font-weight:700;font-size:14px;">${escapeHtml(u.fullName)}</div>
+                    <div style="font-size:12px;color:var(--text-muted);">@${escapeHtml(u.username)}</div>
+                  </div>
+                </label>
+              `).join("")}
+            </div>
+          </div>
+          <div class="modal-actions">
+            <button type="button" class="btn-secondary" id="cancelGroupBtn">ביטול</button>
+            <button type="button" class="btn-primary" id="submitGroupBtn" style="width:auto;">צור קבוצה</button>
+          </div>
+        `);
+
+        $("closeGroupModal").onclick = closeModal;
+        $("cancelGroupBtn").onclick = closeModal;
+        $("submitGroupBtn").onclick = async () => {
+          const name = $("newGroupName").value.trim();
+          const desc = $("newGroupDesc").value.trim();
+          const selected = [...$("modalContent").querySelectorAll(".group-member-cb:checked")].map((cb) => cb.value);
+
+          if (!name) {
+            showToast("נא להזין שם לקבוצה.");
+            return;
+          }
+
+          const participants = [...new Set([meId, ...selected])];
+          const { data: inserted, error } = await sb.from("chats").insert({
+            type: "group",
+            name,
+            description: desc,
+            participants,
+            admins: [meId],
+            only_admins_send: false
+          }).select().single();
+
+          if (error) {
+            showToast("שגיאה ביצירת הקבוצה: " + error.message);
+            return;
+          }
+
+          const mappedChat = mapChatFromDB(inserted);
+          state.chats[mappedChat.id] = mappedChat;
+
+          await sb.from("messages").insert({
+            chat_id: mappedChat.id,
+            sender_id: meId,
+            type: "system",
+            text: `${state.users[meId]?.fullName || "מנהל"} יצר/ה את הקבוצה "${name}"`
+          });
+
+          closeModal();
+          switchMainTab("chats");
+          openChat(mappedChat.id);
+          showToast(`הקבוצה "${name}" נוצרה בהצלחה!`);
+        };
+      }
+
+      /* ===================== DRAWERS: PROFILE, CHAT INFO, SETTINGS, STARRED ===================== */
+      function openDrawer(title, htmlContent) {
+        $("drawerTitle").textContent = title;
+        $("drawerBody").innerHTML = htmlContent;
+        $("rightDrawer").classList.remove("hidden");
+      }
+
+      function closeDrawer() {
+        $("rightDrawer").classList.add("hidden");
+      }
+
+      function openMyProfileDrawer() {
+        const me = state.users[state.currentUserId];
+        if (!me) return;
+
+        openDrawer("הפרופיל שלי", `
+          <div class="drawer-section" style="text-align:center;">
+            <div style="display:inline-block;position:relative;cursor:pointer;" id="editMyAvatarTrigger" title="החלף תמונת פרופיל">
+              ${renderAvatarHTML(me, "xl", false)}
+              <div style="position:absolute;bottom:4px;left:4px;background:var(--accent);color:#fff;width:32px;height:32px;border-radius:50%;display:flex;align-items:center;justify-content:center;box-shadow:var(--shadow-md);">📷</div>
+            </div>
+            <input type="file" id="changeMyAvatarInput" accept="image/*" class="hidden" />
+            <div style="margin-top:10px;font-size:13px;color:var(--text-muted);" dir="ltr">@${escapeHtml(me.username)}</div>
+          </div>
+
+          <div class="drawer-section">
+            <div class="form-group">
+              <label>שם תצוגה מלא</label>
+              <input type="text" id="editMyFullName" class="form-control" value="${escapeHtml(me.fullName)}" maxlength="40" />
+            </div>
+            <div class="form-group">
+              <label>אודות / סטטוס אישי</label>
+              <input type="text" id="editMyBio" class="form-control" value="${escapeHtml(me.bio || "")}" maxlength="90" />
+            </div>
+            <div class="form-group">
+              <label>צבע פרופיל</label>
+              <div class="color-swatches" id="editMyColorSwatches">
+                ${PROFILE_COLORS.map((c) => `<button type="button" class="color-swatch ${me.themeColor === c ? "selected" : ""}" data-color="${c}" style="background:${c};"></button>`).join("")}
+              </div>
+            </div>
+            <button type="button" id="saveMyProfileBtn" class="btn-primary">שמור שינויים בענן</button>
+          </div>
+        `);
+
+        let chosenColor = me.themeColor;
+        $("editMyColorSwatches").addEventListener("click", (e) => {
+          const b = e.target.closest(".color-swatch");
+          if (!b) return;
+          chosenColor = b.dataset.color;
+          $("editMyColorSwatches").querySelectorAll(".color-swatch").forEach((el) => el.classList.remove("selected"));
+          b.classList.add("selected");
+        });
+
+        $("editMyAvatarTrigger").onclick = () => $("changeMyAvatarInput").click();
+        $("changeMyAvatarInput").onchange = async (e) => {
+          const f = e.target.files[0];
+          if (!f) return;
+          showToast("מעלה תמונת פרופיל...");
+          try {
+            const url = await uploadMediaToCloud(f, "avatars", f.name);
+            await sb.from("profiles").update({ avatar_url: url }).eq("id", me.id);
+            me.avatarUrl = url;
+            openMyProfileDrawer();
+            renderAll();
+            showToast("תמונת הפרופיל עודכנה.");
+          } catch (err) {
+            showToast(err.message || "שגיאה בעדכון התמונה.");
+          }
+        };
+
+        $("saveMyProfileBtn").onclick = async () => {
+          const newName = $("editMyFullName").value.trim();
+          const newBio = $("editMyBio").value.trim();
+          if (!newName) {
+            showToast("השם המלא אינו יכול להיות ריק.");
+            return;
+          }
+          const { error } = await sb.from("profiles").update({
+            full_name: newName,
+            bio: newBio,
+            theme_color: chosenColor
+          }).eq("id", me.id);
+
+          if (error) {
+            showToast("שגיאה בשמירת הפרופיל.");
+            return;
+          }
+          me.fullName = newName;
+          me.bio = newBio;
+          me.themeColor = chosenColor;
+          renderAll();
+          showToast("הפרופיל עודכן בהצלחה!");
+        };
+      }
+
+      function openChatInfoDrawer() {
+        const chat = state.chats[state.activeChatId];
+        if (!chat) return;
+        const meId = state.currentUserId;
+        const meta = getChatDisplayMeta(chat);
+        const isMuted = (chat.mutedBy || []).includes(meId);
+
+        const sharedImgs = getChatMessages(chat.id)
+          .filter((m) => m.type === "image" && m.mediaUrl && !m.deletedForEveryone)
+          .slice(-9)
+          .reverse();
+
+        const sharedMediaHTML = sharedImgs.length > 0
+          ? `<div class="drawer-section">
+              <div style="font-size:12px;color:var(--accent);font-weight:700;">מדיה ותמונות משותפות (${sharedImgs.length})</div>
+              <div class="media-grid-mini">
+                ${sharedImgs.map((im) => `<img src="${escapeHtml(im.mediaUrl)}" data-drawer-img="${escapeHtml(im.mediaUrl)}" alt="מדיה" />`).join("")}
+              </div>
+            </div>`
+          : "";
+
+        if (isSelfChat(chat)) {
+          openDrawer("פרטי צ'אט אישי", `
+            <div class="drawer-section" style="text-align:center;">
+              <div style="display:inline-block;">${renderAvatarHTML(meta.avatarEntity, "xl", true)}</div>
+              <h3 style="margin-top:12px;font-size:19px;">${escapeHtml(meta.title)}</h3>
+              <p style="font-size:13px;color:var(--text-secondary);margin-top:6px;">
+                מרחב אישי להודעות שמורות, קבצים, תמונות והערות המסונכרן בכל המכשירים שלך.
+              </p>
+            </div>
+            ${sharedMediaHTML}
+            <div class="drawer-section">
+              <button type="button" id="btnDrawerClearChat" class="btn-secondary" style="width:100%;color:var(--danger);">🗑️ נקה היסטוריית צ'אט אצלי</button>
+            </div>
+          `);
+          bindDrawerCommonActions(chat);
+          return;
+        }
+
+        if (chat.type === "private" && meta.otherUser) {
+          const other = meta.otherUser;
+          const blocked = isUserBlocked(other.id);
+
+          openDrawer("פרטי איש קשר", `
+            <div class="drawer-section" style="text-align:center;">
+              <div style="display:inline-block;">${renderAvatarHTML(other, "xl", isUserVisiblyOnline(other))}</div>
+              <h3 style="margin-top:12px;font-size:19px;">${escapeHtml(other.fullName)}</h3>
+              <div style="font-size:13.5px;color:var(--text-muted);margin-top:2px;" dir="ltr">@${escapeHtml(other.username)}</div>
+              <div style="font-size:13px;color:var(--accent);margin-top:6px;">${escapeHtml(getUserStatusLabel(other))}</div>
+            </div>
+
+            <div class="drawer-section">
+              <div style="font-size:12px;color:var(--accent);font-weight:700;margin-bottom:4px;">אודות</div>
+              <div style="font-size:14.5px;">${escapeHtml(other.bio || "אין תיאור")}</div>
+            </div>
+
+            ${sharedMediaHTML}
+
+            <div class="drawer-section">
+              <div class="setting-row">
+                <span>השתק התראות משיחה זו</span>
+                <label class="switch">
+                  <input type="checkbox" id="drawerMuteToggle" ${isMuted ? "checked" : ""} />
+                  <span class="slider"></span>
+                </label>
+              </div>
+              <div style="margin-top:14px;display:flex;flex-direction:column;gap:10px;">
+                <button type="button" id="btnDrawerClearChat" class="btn-secondary" style="width:100%;">🗑️ נקה היסטוריית שיחה אצלי</button>
+                <button type="button" id="btnDrawerBlockUser" class="btn-danger" style="width:100%;">
+                  ${blocked ? "🔓 בטל חסימת משתמש" : "🚫 חסום משתמש זה"}
+                </button>
+              </div>
+            </div>
+          `);
+
+          bindDrawerCommonActions(chat);
+
+          $("btnDrawerBlockUser").onclick = async () => {
+            const me = state.users[meId];
+            const nextBlocked = [...(me.blockedUsers || [])];
+            const idx = nextBlocked.indexOf(other.id);
+            if (idx >= 0) nextBlocked.splice(idx, 1);
+            else nextBlocked.push(other.id);
+
+            await sb.from("profiles").update({ blocked_users: nextBlocked }).eq("id", meId);
+            me.blockedUsers = nextBlocked;
+            openChatInfoDrawer();
+            renderActiveChat();
+            showToast(idx >= 0 ? "החסימה בוטלה." : "המשתמש נחסם.");
+          };
+        } else if (chat.type === "group") {
+          const isAdmin = (chat.admins || []).includes(meId);
+          const nonMembers = Object.values(state.users).filter((u) => !chat.participants.includes(u.id) && !u.isBanned);
+
+          openDrawer("פרטי קבוצה", `
+            <div class="drawer-section" style="text-align:center;">
+              <div style="display:inline-block;">${renderAvatarHTML(meta.avatarEntity, "xl", false)}</div>
+              ${isAdmin ? `
+                <div class="form-group" style="margin-top:12px;text-align:right;">
+                  <label>שם הקבוצה</label>
+                  <input type="text" id="editGroupNameInp" class="form-control" value="${escapeHtml(chat.name)}" />
+                </div>
+                <div class="form-group" style="text-align:right;">
+                  <label>תיאור הקבוצה</label>
+                  <input type="text" id="editGroupDescInp" class="form-control" value="${escapeHtml(chat.description || "")}" />
+                </div>
+                <button type="button" id="saveGroupMetaBtn" class="btn-primary">עדכן פרטי קבוצה</button>
+              ` : `
+                <h3 style="margin-top:12px;font-size:19px;">${escapeHtml(chat.name)}</h3>
+                <p style="font-size:13.5px;color:var(--text-secondary);margin-top:4px;">${escapeHtml(chat.description || "קבוצה")}</p>
+              `}
+            </div>
+
+            ${sharedMediaHTML}
+
+            <div class="drawer-section">
+              <div class="setting-row">
+                <span>השתק התראות מקבוצה זו</span>
+                <label class="switch">
+                  <input type="checkbox" id="drawerMuteToggle" ${isMuted ? "checked" : ""} />
+                  <span class="slider"></span>
+                </label>
+              </div>
+              ${isAdmin ? `
+                <div class="setting-row">
+                  <span>רק מנהלים יכולים לשלוח הודעות</span>
+                  <label class="switch">
+                    <input type="checkbox" id="drawerOnlyAdminsToggle" ${chat.onlyAdminsSend ? "checked" : ""} />
+                    <span class="slider"></span>
+                  </label>
+                </div>
+              ` : ""}
+            </div>
+
+            <div class="drawer-section">
+              <div style="font-size:13px;font-weight:700;color:var(--accent);margin-bottom:10px;">
+                משתתפים (${chat.participants.length})
+              </div>
+              ${chat.participants.map((pid) => {
+                const u = state.users[pid];
+                if (!u) return "";
+                const memberIsAdmin = (chat.admins || []).includes(pid);
+                return `
+                  <div class="setting-row">
+                    <div style="display:flex;align-items:center;gap:10px;min-width:0;">
+                      ${renderAvatarHTML(u, "sm", isUserVisiblyOnline(u))}
+                      <div style="min-width:0;">
+                        <div style="font-weight:600;font-size:14px;">${escapeHtml(u.fullName)} ${pid === meId ? "(את/ה)" : ""}</div>
+                        <div style="font-size:11.5px;color:var(--accent);">${memberIsAdmin ? "מנהל קבוצה" : ""}</div>
+                      </div>
+                    </div>
+                    ${isAdmin && pid !== meId ? `
+                      <div style="display:flex;gap:4px;">
+                        <button type="button" class="btn-secondary" style="padding:4px 8px;font-size:11.5px;" data-toggle-admin="${pid}">
+                          ${memberIsAdmin ? "הסר ניהול" : "מנה למנהל"}
+                        </button>
+                        <button type="button" class="btn-danger" style="padding:4px 8px;font-size:11.5px;" data-remove-member="${pid}">הסר</button>
+                      </div>
+                    ` : ""}
+                  </div>
+                `;
+              }).join("")}
+
+              ${isAdmin && nonMembers.length > 0 ? `
+                <div style="margin-top:14px;">
+                  <label style="font-size:12.5px;font-weight:700;display:block;margin-bottom:6px;">הוסף משתמש לקבוצה:</label>
+                  <div style="display:flex;gap:8px;">
+                    <select id="addMemberSelect" class="form-control" style="padding:8px;">
+                      ${nonMembers.map((u) => `<option value="${u.id}">${escapeHtml(u.fullName)} (@${escapeHtml(u.username)})</option>`).join("")}
+                    </select>
+                    <button type="button" id="btnAddGroupMember" class="btn-primary" style="width:auto;">הוסף</button>
+                  </div>
+                </div>
+              ` : ""}
+            </div>
+
+            <div class="drawer-section" style="display:flex;flex-direction:column;gap:10px;">
+              <button type="button" id="btnDrawerClearChat" class="btn-secondary" style="width:100%;">🗑️ נקה היסטוריית שיחה אצלי</button>
+              <button type="button" id="btnLeaveGroup" class="btn-danger" style="width:100%;">🚪 עזוב קבוצה</button>
+            </div>
+          `);
+
+          bindDrawerCommonActions(chat);
+
+          if (isAdmin) {
+            $("saveGroupMetaBtn").onclick = async () => {
+              const newName = $("editGroupNameInp").value.trim();
+              const newDesc = $("editGroupDescInp").value.trim();
+              if (!newName) return;
+              await sb.from("chats").update({ name: newName, description: newDesc }).eq("id", chat.id);
+              chat.name = newName;
+              chat.description = newDesc;
+              renderAll();
+              showToast("פרטי הקבוצה עודכנו.");
+            };
+
+            $("drawerOnlyAdminsToggle").onchange = async (e) => {
+              const val = e.target.checked;
+              await sb.from("chats").update({ only_admins_send: val }).eq("id", chat.id);
+              chat.onlyAdminsSend = val;
+              renderActiveChat();
+            };
+
+            $("drawerBody").querySelectorAll("[data-toggle-admin]").forEach((btn) => {
+              btn.onclick = async () => {
+                const uidKey = btn.dataset.toggleAdmin;
+                const nextAdmins = [...(chat.admins || [])];
+                const idx = nextAdmins.indexOf(uidKey);
+                if (idx >= 0) nextAdmins.splice(idx, 1);
+                else nextAdmins.push(uidKey);
+                await sb.from("chats").update({ admins: nextAdmins }).eq("id", chat.id);
+                chat.admins = nextAdmins;
+                openChatInfoDrawer();
+              };
+            });
+
+            $("drawerBody").querySelectorAll("[data-remove-member]").forEach((btn) => {
+              btn.onclick = async () => {
+                const uidKey = btn.dataset.removeMember;
+                const nextParticipants = chat.participants.filter((id) => id !== uidKey);
+                const nextAdmins = (chat.admins || []).filter((id) => id !== uidKey);
+                await sb.from("chats").update({ participants: nextParticipants, admins: nextAdmins }).eq("id", chat.id);
+                await sb.from("messages").insert({
+                  chat_id: chat.id,
+                  sender_id: meId,
+                  type: "system",
+                  text: `${state.users[uidKey]?.fullName || "משתמש"} הוסר/ה מהקבוצה`
+                });
+                chat.participants = nextParticipants;
+                chat.admins = nextAdmins;
+                openChatInfoDrawer();
+                renderActiveChat();
+              };
+            });
+
+            const addBtn = $("btnAddGroupMember");
+            if (addBtn) {
+              addBtn.onclick = async () => {
+                const uidKey = $("addMemberSelect").value;
+                if (!uidKey) return;
+                const nextParticipants = [...chat.participants, uidKey];
+                await sb.from("chats").update({ participants: nextParticipants }).eq("id", chat.id);
+                await sb.from("messages").insert({
+                  chat_id: chat.id,
+                  sender_id: meId,
+                  type: "system",
+                  text: `${state.users[uidKey]?.fullName || "משתמש"} צורף/ה לקבוצה`
+                });
+                chat.participants = nextParticipants;
+                openChatInfoDrawer();
+                renderActiveChat();
+              };
+            }
+          }
+
+          $("btnLeaveGroup").onclick = async () => {
+            const nextParticipants = chat.participants.filter((id) => id !== meId);
+            const nextAdmins = (chat.admins || []).filter((id) => id !== meId);
+            await sb.from("chats").update({ participants: nextParticipants, admins: nextAdmins }).eq("id", chat.id);
+            await sb.from("messages").insert({
+              chat_id: chat.id,
+              sender_id: meId,
+              type: "system",
+              text: `${state.users[meId]?.fullName || "משתמש"} עזב/ה את הקבוצה`
+            });
+            delete state.chats[chat.id];
+            closeDrawer();
+            closeChatMobile();
+            showToast("עזבת את הקבוצה.");
+          };
+        }
+      }
+
+      function bindDrawerCommonActions(chat) {
+        const meId = state.currentUserId;
+        $("drawerBody").querySelectorAll("[data-drawer-img]").forEach((img) => {
+          img.onclick = () => {
+            const src = img.dataset.drawerImg;
+            openModal(`<div style="text-align:center;"><img src="${escapeHtml(src)}" class="lightbox-img" /></div>`, true);
+          };
+        });
+
+        const muteToggle = $("drawerMuteToggle");
+        if (muteToggle) {
+          muteToggle.onchange = async (e) => {
+            const nextMuted = [...(chat.mutedBy || [])];
+            const idx = nextMuted.indexOf(meId);
+            if (e.target.checked && idx < 0) nextMuted.push(meId);
+            if (!e.target.checked && idx >= 0) nextMuted.splice(idx, 1);
+            await sb.from("chats").update({ muted_by: nextMuted }).eq("id", chat.id);
+            chat.mutedBy = nextMuted;
+            renderSidebar();
+          };
+        }
+
+        const clearBtn = $("btnDrawerClearChat");
+        if (clearBtn) {
+          clearBtn.onclick = async () => {
+            const ids = getChatMessages(chat.id).map((m) => m.id);
+            await deleteMessageForMe(ids);
+            showToast("היסטוריית השיחה נוקתה אצלך.");
+          };
+        }
+      }
+
+      function openSettingsDrawer() {
+        const me = state.users[state.currentUserId];
+        if (!me) return;
+
+        openDrawer("הגדרות אישיות", `
+          <div class="drawer-section">
+            <div style="font-size:12px;color:var(--accent);font-weight:700;margin-bottom:8px;">תצוגה ועיצוב</div>
+            <div class="setting-row">
+              <span>מצב כהה (Dark Mode)</span>
+              <label class="switch">
+                <input type="checkbox" id="setDarkTheme" ${state.settings.theme === "dark" ? "checked" : ""} />
+                <span class="slider"></span>
+              </label>
+            </div>
+            <div class="setting-row">
+              <span>גודל טקסט בהודעות</span>
+              <select id="setFontSize" class="form-control" style="width:auto;padding:6px 10px;">
+                <option value="13px" ${state.settings.fontSize === "13px" ? "selected" : ""}>קטן</option>
+                <option value="14.5px" ${state.settings.fontSize === "14.5px" ? "selected" : ""}>רגיל</option>
+                <option value="16.5px" ${state.settings.fontSize === "16.5px" ? "selected" : ""}>גדול</option>
+              </select>
+            </div>
+          </div>
+
+          <div class="drawer-section">
+            <div style="font-size:12px;color:var(--accent);font-weight:700;margin-bottom:8px;">התראות וצלילים</div>
+            <div class="setting-row">
+              <span>התראות קופצות על הודעות חדשות</span>
+              <label class="switch">
+                <input type="checkbox" id="setInAppNotif" ${state.settings.inAppNotifications ? "checked" : ""} />
+                <span class="slider"></span>
+              </label>
+            </div>
+            <div class="setting-row">
+              <span>צליל התראה בקבלת הודעה</span>
+              <label class="switch">
+                <input type="checkbox" id="setSoundEnabled" ${state.settings.soundEnabled ? "checked" : ""} />
+                <span class="slider"></span>
+              </label>
+            </div>
+          </div>
+
+          <div class="drawer-section">
+            <div style="font-size:12px;color:var(--accent);font-weight:700;margin-bottom:8px;">פרטיות (מסונכרן בענן)</div>
+            <div class="setting-row">
+              <span>הצג סטטוס "מחובר עכשיו"</span>
+              <label class="switch">
+                <input type="checkbox" id="privOnline" ${me.privacy?.online !== false ? "checked" : ""} />
+                <span class="slider"></span>
+              </label>
+            </div>
+            <div class="setting-row">
+              <span>הצג שעת "נראה לאחרונה"</span>
+              <label class="switch">
+                <input type="checkbox" id="privLastSeen" ${me.privacy?.lastSeen !== false ? "checked" : ""} />
+                <span class="slider"></span>
+              </label>
+            </div>
+            <div class="setting-row">
+              <span>אישורי קריאה (וי כחול)</span>
+              <label class="switch">
+                <input type="checkbox" id="privReadReceipts" ${me.privacy?.readReceipts !== false ? "checked" : ""} />
+                <span class="slider"></span>
+              </label>
+            </div>
+          </div>
+
+          <div class="drawer-section">
+            <button type="button" id="btnLogoutFromSettings" class="btn-danger" style="width:100%;">
+              התנתקות מהחשבון
+            </button>
+          </div>
+        `);
+
+        $("setDarkTheme").onchange = (e) => {
+          state.settings.theme = e.target.checked ? "dark" : "light";
+          saveLocalUISettings();
+          applySettingsToDOM();
+        };
+
+        $("setFontSize").onchange = (e) => {
+          state.settings.fontSize = e.target.value;
+          saveLocalUISettings();
+          applySettingsToDOM();
+        };
+
+        $("setInAppNotif").onchange = (e) => {
+          state.settings.inAppNotifications = e.target.checked;
+          if (e.target.checked) requestBrowserNotificationPermission();
+          saveLocalUISettings();
+        };
+
+        $("setSoundEnabled").onchange = (e) => {
+          state.settings.soundEnabled = e.target.checked;
+          saveLocalUISettings();
+        };
+
+        const savePrivacy = async () => {
+          const nextPriv = {
+            online: $("privOnline").checked,
+            lastSeen: $("privLastSeen").checked,
+            readReceipts: $("privReadReceipts").checked
+          };
+          me.privacy = nextPriv;
+          await sb.from("profiles").update({ privacy: nextPriv }).eq("id", me.id);
+          await updateMyPresence(true);
+          renderAll();
+        };
+
+        $("privOnline").onchange = savePrivacy;
+        $("privLastSeen").onchange = savePrivacy;
+        $("privReadReceipts").onchange = savePrivacy;
+
+        $("btnLogoutFromSettings").onclick = logoutCurrentUser;
+      }
+
+      function openStarredMessagesDrawer() {
+        const meId = state.currentUserId;
+        const starred = Object.values(state.messages)
+          .filter((m) => (m.starredBy || []).includes(meId) && !m.deletedForEveryone && !(m.deletedFor || []).includes(meId))
+          .sort((a, b) => b.createdAt - a.createdAt);
+
+        openDrawer(`הודעות מסומנות בכוכב (${starred.length})`, `
+          <div style="padding:12px;">
+            ${starred.length === 0 ? `
+              <div class="empty-state">
+                <div style="font-size:36px;">⭐</div>
+                <div>אין הודעות מסומנות בכוכב עדיין.</div>
+              </div>
+            ` : starred.map((m) => {
+              const chat = state.chats[m.chatId];
+              const sender = state.users[m.senderId];
+              return `
+                <div class="existing-user-item" style="margin-bottom:8px;cursor:pointer;flex-direction:column;align-items:stretch;" data-star-jump-chat="${m.chatId}" data-star-jump-msg="${m.id}">
+                  <div style="display:flex;justify-content:space-between;font-size:12px;color:var(--accent);font-weight:700;">
+                    <span>${escapeHtml(sender?.fullName || "משתמש")} • ${escapeHtml(chat ? getChatDisplayMeta(chat).title : "")}</span>
+                    <span>${formatTime(m.createdAt)}</span>
+                  </div>
+                  <div style="font-size:13.5px;margin-top:4px;">${escapeHtml(getMessagePreviewText(m))}</div>
+                </div>
+              `;
+            }).join("")}
+          </div>
+        `);
+
+        $("drawerBody").querySelectorAll("[data-star-jump-chat]").forEach((el) => {
+          el.onclick = () => {
+            closeDrawer();
+            openChat(el.dataset.starJumpChat, el.dataset.starJumpMsg);
+          };
+        });
+      }
+
+      /* ===================== MODAL & ACCOUNT SWITCHING ===================== */
+      function openModal(html, transparentBox = false) {
+        const box = $("modalContent");
+        box.innerHTML = html;
+        if (transparentBox) {
+          box.style.background = "transparent";
+          box.style.boxShadow = "none";
+          box.style.maxWidth = "95vw";
+        } else {
+          box.style.background = "";
+          box.style.boxShadow = "";
+          box.style.maxWidth = "";
+        }
+        $("modalBackdrop").classList.remove("hidden");
+      }
+
+      function closeModal() {
+        $("modalBackdrop").classList.add("hidden");
+      }
+
+      async function logoutCurrentUser() {
+        const me = state.users[state.currentUserId];
+        if (me && me.isBanned && !state.isAdminMode) {
+          enforceSystemLockAndBan();
+          return;
+        }
+        try {
+          if (state.currentUserId && sb) {
+            await withTimeout(updateMyPresence(false), 1500);
+          }
+          if (realtimeChannel && sb) {
+            sb.removeChannel(realtimeChannel);
+            realtimeChannel = null;
+          }
+          if (sb) {
+            await withTimeout(sb.auth.signOut(), 2000);
+          }
+        } catch (_) {}
+
+        saveAdminSessionFlag(null, false);
+        state.currentUserId = null;
+        state.activeChatId = null;
+        state.isAdminMode = false;
+        state.adminConsoleLogs = [];
+        state.chats = {};
+        state.messages = {};
+        closeDrawer();
+        closeModal();
+        showAuthScreen(false);
+        enforceSystemLockAndBan();
+        updateDocumentTabTitle();
+      }
+
+      function updateComposerButtonState() {
+        const hasText = $("messageTextarea").value.trim().length > 0;
+        if (hasText || mediaRecorder) {
+          $("micIconSvg").classList.add("hidden");
+          $("sendIconSvg").classList.remove("hidden");
+        } else {
+          $("sendIconSvg").classList.add("hidden");
+          $("micIconSvg").classList.remove("hidden");
+        }
+      }
+
+      function renderAll() {
+        if (!state.currentUserId) return;
+        renderSidebar();
+        if (state.activeChatId) renderActiveChat();
+      }
+
+      /* ===================== GLOBAL EVENT BINDINGS ===================== */
+      function bindGlobalEvents() {
+        $("lockOverlayLogoutBtn").addEventListener("click", logoutCurrentUser);
+        $("lockOverlayAdminLoginBtn").addEventListener("click", () => {
+          state.bypassLockForLogin = true;
+          $("systemLockOverlay").classList.add("hidden");
+          showAuthScreen(false);
+        });
+
+        $("globalSearchInput").addEventListener("input", (e) => {
+          state.searchQuery = e.target.value;
+          $("clearGlobalSearch").classList.toggle("hidden", !state.searchQuery);
+          renderSidebar();
+        });
+
+        $("clearGlobalSearch").addEventListener("click", () => {
+          state.searchQuery = "";
+          $("globalSearchInput").value = "";
+          $("clearGlobalSearch").classList.add("hidden");
+          renderSidebar();
+        });
+
+        $("filterChips").addEventListener("click", (e) => {
+          const chip = e.target.closest(".chip");
+          if (!chip) return;
+          state.activeFilter = chip.dataset.filter;
+          $("filterChips").querySelectorAll(".chip").forEach((c) => c.classList.remove("active"));
+          chip.classList.add("active");
+          renderSidebar();
+        });
+
+        document.querySelectorAll(".main-tab").forEach((tab) => {
+          tab.addEventListener("click", () => switchMainTab(tab.dataset.tab));
+        });
+
+        $("welcomeGoUsersBtn").addEventListener("click", () => switchMainTab("users"));
+        $("welcomeSelfChatBtn").addEventListener("click", async () => {
+          const selfChat = await getOrCreateSelfChat();
+          if (selfChat) openChat(selfChat.id);
+        });
+
+        $("myProfileTrigger").addEventListener("click", openMyProfileDrawer);
+        $("btnNewGroup").addEventListener("click", showCreateGroupModal);
+        $("btnStarredView").addEventListener("click", openStarredMessagesDrawer);
+        $("btnSwitchAccount").addEventListener("click", logoutCurrentUser);
+        $("btnOpenSettings").addEventListener("click", openSettingsDrawer);
+        $("closeDrawerBtn").addEventListener("click", closeDrawer);
+
+        $("btnChatBack").addEventListener("click", closeChatMobile);
+        $("chatHeaderInfo").addEventListener("click", openChatInfoDrawer);
+        $("btnOpenChatProfile").addEventListener("click", openChatInfoDrawer);
+
+        $("btnTogglePinChat").addEventListener("click", async () => {
+          const chat = state.chats[state.activeChatId];
+          const meId = state.currentUserId;
+          if (!chat) return;
+          const nextPinnedBy = [...(chat.pinnedBy || [])];
+          const idx = nextPinnedBy.indexOf(meId);
+          if (idx >= 0) nextPinnedBy.splice(idx, 1);
+          else nextPinnedBy.push(meId);
+          chat.pinnedBy = nextPinnedBy;
+          renderSidebar();
+          showToast(idx >= 0 ? "הצמדת השיחה בוטלה." : "השיחה הוצמדה לראש הרשימה.");
+          await sb.from("chats").update({ pinned_by: nextPinnedBy }).eq("id", chat.id);
+        });
+
+        $("btnToggleInChatSearch").addEventListener("click", () => {
+          state.inChatSearchOpen = !state.inChatSearchOpen;
+          $("inChatSearchBar").classList.toggle("hidden", !state.inChatSearchOpen);
+          if (state.inChatSearchOpen) $("inChatSearchInput").focus();
+          else {
+            state.inChatQuery = "";
+            $("inChatSearchInput").value = "";
+            renderActiveChat();
+          }
+        });
+
+        $("closeInChatSearch").addEventListener("click", () => {
+          state.inChatSearchOpen = false;
+          state.inChatQuery = "";
+          $("inChatSearchInput").value = "";
+          $("inChatSearchBar").classList.add("hidden");
+          renderActiveChat();
+        });
+
+        $("inChatSearchInput").addEventListener("input", (e) => {
+          state.inChatQuery = e.target.value;
+          renderActiveChat();
+        });
+
+        $("pinnedMessageBanner").addEventListener("click", () => {
+          const chat = state.chats[state.activeChatId];
+          if (chat?.pinnedMessageId) {
+            const el = $("msg_" + chat.pinnedMessageId);
+            if (el) el.scrollIntoView({ behavior: "smooth", block: "center" });
+          }
+        });
+
+        $("btnUnpinBannerMsg").addEventListener("click", async (e) => {
+          e.stopPropagation();
+          const chat = state.chats[state.activeChatId];
+          if (!chat) return;
+          chat.pinnedMessageId = null;
+          renderActiveChat();
+          await sb.from("chats").update({ pinned_message_id: null }).eq("id", chat.id);
+        });
+
+        $("messagesContainer").addEventListener("scroll", () => {
+          const c = $("messagesContainer");
+          const distFromBottom = c.scrollHeight - c.scrollTop - c.clientHeight;
+          $("scrollBottomBtn").classList.toggle("hidden", distFromBottom < 220);
+        });
+
+        $("scrollBottomBtn").addEventListener("click", () => {
+          const c = $("messagesContainer");
+          c.scrollTop = c.scrollHeight;
+        });
+
+        $("cancelMultiSelect").addEventListener("click", () => {
+          state.multiSelectMode = false;
+          state.selectedMsgIds.clear();
+          renderActiveChat();
+        });
+
+        $("deleteSelectedBtn").addEventListener("click", async () => {
+          if (state.selectedMsgIds.size === 0) return;
+          const count = state.selectedMsgIds.size;
+          await deleteMessageForMe([...state.selectedMsgIds]);
+          state.multiSelectMode = false;
+          state.selectedMsgIds.clear();
+          renderActiveChat();
+          showToast(`${count} הודעות נמחקו אצלך.`);
+        });
+
+        $("cancelReplyEditBtn").addEventListener("click", () => {
+          state.replyToMsgId = null;
+          state.editingMsgId = null;
+          $("messageTextarea").value = "";
+          updateComposerButtonState();
+          renderActiveChat();
+        });
+
+        $("unblockFromBannerBtn").addEventListener("click", async () => {
+          const chat = state.chats[state.activeChatId];
+          const me = state.users[state.currentUserId];
+          if (!chat || !me) return;
+          const otherId = chat.participants.find((id) => id !== me.id);
+          const nextBlocked = (me.blockedUsers || []).filter((id) => id !== otherId);
+          me.blockedUsers = nextBlocked;
+          renderActiveChat();
+          showToast("החסימה בוטלה.");
+          await sb.from("profiles").update({ blocked_users: nextBlocked }).eq("id", me.id);
+        });
+
+        $("emojiGrid").innerHTML = EMOJIS.map((em) => `<button type="button" class="emoji-btn">${em}</button>`).join("");
+        $("emojiGrid").addEventListener("click", (e) => {
+          const btn = e.target.closest(".emoji-btn");
+          if (!btn) return;
+          const ta = $("messageTextarea");
+          ta.value += btn.textContent;
+          ta.focus();
+          updateComposerButtonState();
+        });
+
+        $("btnEmojiToggle").addEventListener("click", (e) => {
+          e.stopPropagation();
+          $("attachPopover").classList.add("hidden");
+          $("mentionPopover").classList.add("hidden");
+          $("adminSlashPopover").classList.add("hidden");
+          $("emojiPickerPopover").classList.toggle("hidden");
+        });
+
+        $("btnAttachToggle").addEventListener("click", (e) => {
+          e.stopPropagation();
+          $("emojiPickerPopover").classList.add("hidden");
+          $("mentionPopover").classList.add("hidden");
+          $("adminSlashPopover").classList.add("hidden");
+          $("attachPopover").classList.toggle("hidden");
+        });
+
+        // Admin Slash Menu actions
+        $("btnSlashCommandList").addEventListener("click", async () => {
+          $("adminSlashPopover").classList.add("hidden");
+          $("messageTextarea").value = "";
+          $("messageTextarea").style.height = "auto";
+          updateComposerButtonState();
+          await handleAdminSelfChatCommand("/רשימת פקודות");
+        });
+
+        $("btnSlashExitAdmin").addEventListener("click", async () => {
+          $("adminSlashPopover").classList.add("hidden");
+          $("messageTextarea").value = "";
+          $("messageTextarea").style.height = "auto";
+          updateComposerButtonState();
+          await handleAdminSelfChatCommand("/יציאה ממצב מנהל");
+        });
+
+        $("btnAttachImage").addEventListener("click", () => {
+          $("attachPopover").classList.add("hidden");
+          $("imageFileInput").click();
+        });
+
+        $("btnAttachFile").addEventListener("click", () => {
+          $("attachPopover").classList.add("hidden");
+          $("docFileInput").click();
+        });
+
+        $("btnCreatePoll").addEventListener("click", () => {
+          $("attachPopover").classList.add("hidden");
+          showCreatePollModal();
+        });
+
+        $("imageFileInput").addEventListener("change", (e) => {
+          handleFileUpload(e.target.files[0], "image");
+          e.target.value = "";
+        });
+
+        $("docFileInput").addEventListener("change", (e) => {
+          handleFileUpload(e.target.files[0], "file");
+          e.target.value = "";
+        });
+
+        const textarea = $("messageTextarea");
+        textarea.addEventListener("input", () => {
+          textarea.style.height = "auto";
+          textarea.style.height = Math.min(textarea.scrollHeight, 120) + "px";
+          updateComposerButtonState();
+          handleAdminSlashPopover();
+          handleMentionAutocomplete();
+
+          if (textarea.value.trim().length > 0) {
+            setTypingState("typing");
+            clearTimeout(typingTimeout);
+            typingTimeout = setTimeout(() => setTypingState(null), 2600);
+          } else {
+            setTypingState(null);
+          }
+        });
+
+        textarea.addEventListener("keydown", async (e) => {
+          if (e.key === "Enter" && !e.shiftKey) {
+            e.preventDefault();
+            $("adminSlashPopover").classList.add("hidden");
+            const val = textarea.value.trim();
+            if (val) {
+              textarea.value = "";
+              textarea.style.height = "auto";
+              updateComposerButtonState();
+              await sendMessage({ type: "text", text: val });
+            }
+          }
+        });
+
+        $("btnSendOrMic").addEventListener("click", async () => {
+          if (mediaRecorder) {
+            stopVoiceRecording(true);
+            return;
+          }
+          $("adminSlashPopover").classList.add("hidden");
+          const val = textarea.value.trim();
+          if (val) {
+            textarea.value = "";
+            textarea.style.height = "auto";
+            updateComposerButtonState();
+            await sendMessage({ type: "text", text: val });
+          } else {
+            startVoiceRecording();
+          }
+        });
+
+        $("cancelRecordingBtn").addEventListener("click", () => stopVoiceRecording(false));
+
+        document.addEventListener("click", (e) => {
+          if (!e.target.closest("#msgContextMenu") && !e.target.closest("[data-open-menu]")) {
+            closeContextMenu();
+          }
+          if (!e.target.closest("#emojiPickerPopover") && !e.target.closest("#btnEmojiToggle")) {
+            $("emojiPickerPopover").classList.add("hidden");
+          }
+          if (!e.target.closest("#attachPopover") && !e.target.closest("#btnAttachToggle")) {
+            $("attachPopover").classList.add("hidden");
+          }
+          if (!e.target.closest("#mentionPopover") && !e.target.closest("#messageTextarea")) {
+            $("mentionPopover").classList.add("hidden");
+          }
+          if (!e.target.closest("#adminSlashPopover") && !e.target.closest("#messageTextarea")) {
+            $("adminSlashPopover").classList.add("hidden");
+          }
+        });
+
+        $("modalBackdrop").addEventListener("click", (e) => {
+          if (e.target === $("modalBackdrop")) closeModal();
+        });
+
+        window.addEventListener("beforeunload", () => {
+          if (state.currentUserId && sb) {
+            updateMyPresence(false);
+          }
+        });
+
+        document.addEventListener("visibilitychange", async () => {
+          if (!state.currentUserId) return;
+          if (document.hidden) {
+            await updateMyPresence(false);
+          } else {
+            await updateMyPresence(true);
+            await markMessagesDeliveredAndRead();
+            renderAll();
+          }
+        });
+
+        setInterval(async () => {
+          if (!state.currentUserId) return;
+          if (!document.hidden) {
+            await updateMyPresence(true);
+          }
+          renderSidebar();
+          if (state.activeChatId) renderActiveChat();
+        }, 15000);
+      }
+
+      /* ===================== BOOTSTRAP APPLICATION ===================== */
+      async function initApp() {
+        loadLocalUISettings();
+        applySettingsToDOM();
+        initAudioAndNotificationUnlock();
+        initAuthUI();
+        bindGlobalEvents();
+
+        if (!sb) {
+          showAuthScreen(false);
+          return;
+        }
+
+        // Fallback safety net so loader can never get stuck
+        const safetyTimer = setTimeout(() => {
+          if (!$("loadingScreen").classList.contains("hidden")) {
+            showAuthScreen(false);
+          }
+        }, 5000);
+
+        try {
+          await fetchGlobalAppSettings();
+          const { data } = await withTimeout(sb.auth.getSession(), 3500);
+          clearTimeout(safetyTimer);
+          if (data?.session?.user) {
+            await completeLoginFlow(data.session.user.id, data.session.user);
+          } else {
+            showAuthScreen(false);
+            enforceSystemLockAndBan();
+          }
+        } catch (_) {
+          clearTimeout(safetyTimer);
+          showAuthScreen(false);
+          enforceSystemLockAndBan();
+        }
+      }
+
+      initApp();
+    })();
+  </script>
+</body>
+</html>
